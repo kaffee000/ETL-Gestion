@@ -30,21 +30,30 @@ def etl_pipeline():
 
   @task()
   def extract_data(config: dict) -> dict:
-    """Extrae los datos de la API en memoria."""
+    """Extrae los datos de la API manejando timeouts y errores de servidor de forma segura."""
     api_key = os.getenv("API_KEY")
 
     url = f"{config['url_template']}?apikey={api_key}&formato=json"
     headers = {"Accept": "application/json"}
 
-    response = requests.get(url, headers=headers, timeout=30)
-    
-    # Manejar errores donde el servidor de la CMF falla
-    if response.status_code in [404, 500, 502, 503, 504]:
-        print(f"Aviso: El servidor de la CMF falló o no tiene el recurso [{config['id_fuente']}] (Código {response.status_code}). Se omite.")
+    try:
+      # Se establece un timeout de 30 segundos
+      response = requests.get(url, headers=headers, timeout=30)
+      
+      # Si el servidor responde con errores conocidos (404, 500, etc.)
+      if response.status_code in [404, 500, 502, 503, 504]:
+        print(f"Aviso: El recurso [{config['id_fuente']}] devolvió el código HTTP {response.status_code}. Se omite.")
         return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
 
-    response.raise_for_status()
-    raw_data = response.json()
+      response.raise_for_status()
+      raw_data = response.json()
+
+    except requests.exceptions.Timeout:
+      print(f"Aviso: Timeout (se superó el tiempo límite) al intentar conectar con [{config['id_fuente']}]. Se omite.")
+      return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
+    except requests.exceptions.RequestException as e:
+      print(f"Aviso: Error de conexión en [{config['id_fuente']}]: {e}. Se omite.")
+      return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
 
     return {
         "id_fuente": config["id_fuente"],
