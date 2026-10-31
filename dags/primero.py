@@ -1,65 +1,120 @@
-from endpoints import API_CONFIGS
-#Para tener control de TIEMPO 
 from datetime import datetime, timedelta
-#Para las funciones DAG de Airflow
+# Para las funciones DAG de Airflow
 from airflow.decorators import dag, task
-
+from endpoints import API_CONFIGS
 import os
 import requests
 import pandas as pd
 import json
+import fcntl
 
-DEFAULT_ARGS = {                            #Parametros para no repetir codigo 
-    'owner': 'airflow',                     #usuario
-    'depends_on_past': False,               #depende del exito de otra tarea
-    'email_on_failure': False,              #notificar por correo si falla
-    'retries': 1,                           #numero de reintentos
-    'retry_delay': timedelta(minutes=5),    #espera entre reintentos
+DEFAULT_ARGS = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
 }
 
+
 @dag(
-    dag_id='etl_CMF',
+    dag_id="etl_CMF",
     default_args=DEFAULT_ARGS,
-    description='ETL pipeline para CMF',
-    schedule='@daily',
+    description="ETL pipeline para CMF",
+    schedule="@daily",
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=['etls', 'chile', 'apis'],
+    tags=["etls", "chile", "apis"],
 )
-
-
-
 def etl_pipeline():
-    @task()
-    def extract_data(config: dict) -> dict:             #dict es para crear librerias o JSON por lo que entendi
-        api_key = os.getenv("API_KEY")      #obtenemos la API almacenada en el .env
 
-        url = f"{config['url_template']}?apikey={api_key}&formato=json"
-        #url = f"https://api.cmfchile.cl/api-sbifv3/recursos_api/balances/2009/12/cuentas/1000000?apikey=SBIF9990SBIF44b7SBIF7f4c5a537d02358e1099&formato=xml"
+  @task()
+  def extract_data(config: dict) -> dict:
+    """Extrae los datos de la API en memoria."""
+    api_key = os.getenv("API_KEY")
 
-        headers = {
-            "Accept": "application/json"            #en que formato quieres la respuesta
-        }
+    url = f"{config['url_template']}?apikey={api_key}&formato=json"
+    headers = {"Accept": "application/json"}
 
-        response = requests.get(url, headers=headers, timeout=30)   #empieza la extraccion de datos
-        if response.status_code == 404:
-            print(f"Aviso: El recurso no existe para [{config['id_fuente']}]. Se omite.")
-            return {"id_fuente": config['id_fuente'], "raw_data": None}
+    response = requests.get(url, headers=headers, timeout=30)
+    
+    # Manejar errores donde el servidor de la CMF falla
+    if response.status_code in [404, 500, 502, 503, 504]:
+        print(f"Aviso: El servidor de la CMF falló o no tiene el recurso [{config['id_fuente']}] (Código {response.status_code}). Se omite.")
+        return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
+
+    response.raise_for_status()
+    raw_data = response.json()
+
+    return {
+        "id_fuente": config["id_fuente"],
+        "tipo": config["tipo"],
+        "raw_data": raw_data,
+    }
+
+  @task()
+  def transform_data(extract_result: dict) -> dict:
+    """Transforma, limpia y guarda los datos directamente en el JSON único de su categoría."""
+    id_fuente = extract_result.get("id_fuente")
+    tipo = extract_result.get("tipo")
+    raw_data = extract_result.get("raw_data")
+
+    if not raw_data:
+      return {"id_fuente": id_fuente, "tipo": tipo, "status": "skipped"}
+
+    # Normalización a DataFrame
+    if isinstance(raw_data, dict):
+      list_keys = [k for k, v in raw_data.items() if isinstance(v, list)]
+      if list_keys:
+        df = pd.json_normalize(raw_data[list_keys[0]])
+      else:
+        df = pd.json_normalize([raw_data])
+    elif isinstance(raw_data, list):
+      df = pd.json_normalize(raw_data)
+    else:
+      df = pd.DataFrame()
+
+    if df.empty:
+      return {"id_fuente": id_fuente, "tipo": tipo, "status": "empty"}
+
+    # Limpieza de duplicados y valores nulos
+    df = df.drop_duplicates()
+    df = df.fillna(value="")
+
+    records = df.to_dict(orient="records")
+
+    # Directorio y archivo único por categoría dentro de la misma ruta
+    output_dir = "/opt/airflow/dags/datos_limpios"
+    os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.join(output_dir, f"datos_limpios_{tipo}.json")
+
+    # Escritura segura con bloqueo (fcntl) para evitar conflictos entre tareas paralelas de Airflow
+    with open(filename, "a+", encoding="utf-8") as f:
+      fcntl.flock(f, fcntl.LOCK_EX)
+      try:
+        f.seek(0)
+        content = f.read()
+        existing_data = json.loads(content) if content.strip() else []
         
-        response.raise_for_status()                                 #verifica si la solicitud fue exitosa
-        raw_data = response.json()  #se almacenan los datos en formato JSON de respuesta
-
-        filename = f"/opt/airflow/dags/raw_{config['id_fuente']}.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(raw_data, f, ensure_ascii=False, indent=4)
+        # Agregar los nuevos registros limpios
+        existing_data.extend(records)
         
-        print(f"Datos extraídos exitosamente: [{config['id_fuente']}].")
-        return {
-            "id_fuente": config['id_fuente'],
-            "tipo": config['tipo'],
-            "raw_data": raw_data
-        }
-    extracted_data_list = extract_data.expand(config=API_CONFIGS)
+        f.seek(0)
+        f.truncate()
+        json.dump(existing_data, f, ensure_ascii=False, indent=4)
+      finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+    print(f"Transformación y guardado exitoso para [{id_fuente}] en [{filename}]")
+    return {
+        "id_fuente": id_fuente,
+        "tipo": tipo,
+        "status": "success"
+    }
+
+  # Encadenamiento del flujo optimizado (Extract -> Transform)
+  extracted_data_list = extract_data.expand(config=API_CONFIGS)
+  transform_data.expand(extract_result=extracted_data_list)
 
 
 dag_instance = etl_pipeline()
