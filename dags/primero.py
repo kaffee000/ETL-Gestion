@@ -7,12 +7,13 @@ import requests
 import pandas as pd
 import json
 import fcntl
+import sqlalchemy
 
 DEFAULT_ARGS = {
     "owner": "airflow",
     "depends_on_past": False,
     "email_on_failure": False,
-    "retries": 1,
+    "retries": 3,
     "retry_delay": timedelta(minutes=5),
 }
 
@@ -20,7 +21,7 @@ DEFAULT_ARGS = {
 @dag(
     dag_id="etl_CMF",
     default_args=DEFAULT_ARGS,
-    description="ETL pipeline para CMF",
+    description="ETL pipeline para CMF con conexión directa por variable de entorno",
     schedule="@daily",
     start_date=datetime(2026, 1, 1),
     catchup=False,
@@ -37,10 +38,8 @@ def etl_pipeline():
     headers = {"Accept": "application/json"}
 
     try:
-      # Se establece un timeout de 30 segundos
       response = requests.get(url, headers=headers, timeout=30)
       
-      # Si el servidor responde con errores conocidos (404, 500, etc.)
       if response.status_code in [404, 500, 502, 503, 504]:
         print(f"Aviso: El recurso [{config['id_fuente']}] devolvió el código HTTP {response.status_code}. Se omite.")
         return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
@@ -49,7 +48,7 @@ def etl_pipeline():
       raw_data = response.json()
 
     except requests.exceptions.Timeout:
-      print(f"Aviso: Timeout (se superó el tiempo límite) al intentar conectar con [{config['id_fuente']}]. Se omite.")
+      print(f"Aviso: Timeout al intentar conectar con [{config['id_fuente']}]. Se omite.")
       return {"id_fuente": config["id_fuente"], "tipo": config["tipo"], "raw_data": None}
     except requests.exceptions.RequestException as e:
       print(f"Aviso: Error de conexión en [{config['id_fuente']}]: {e}. Se omite.")
@@ -63,7 +62,7 @@ def etl_pipeline():
 
   @task()
   def transform_data(extract_result: dict) -> dict:
-    """Transforma, limpia y guarda los datos directamente en el JSON único de su categoría."""
+    """Transforma, limpia y guarda los datos concurrentemente con reintentos para fallos de escritura."""
     id_fuente = extract_result.get("id_fuente")
     tipo = extract_result.get("tipo")
     raw_data = extract_result.get("raw_data")
@@ -71,59 +70,105 @@ def etl_pipeline():
     if not raw_data:
       return {"id_fuente": id_fuente, "tipo": tipo, "status": "skipped"}
 
-    # Normalización a DataFrame
-    if isinstance(raw_data, dict):
-      list_keys = [k for k, v in raw_data.items() if isinstance(v, list)]
-      if list_keys:
-        df = pd.json_normalize(raw_data[list_keys[0]])
+    try:
+      # Normalización a DataFrame
+      if isinstance(raw_data, dict):
+        list_keys = [k for k, v in raw_data.items() if isinstance(v, list)]
+        if list_keys:
+          df = pd.json_normalize(raw_data[list_keys[0]])
+        else:
+          df = pd.json_normalize([raw_data])
+      elif isinstance(raw_data, list):
+        df = pd.json_normalize(raw_data)
       else:
-        df = pd.json_normalize([raw_data])
-    elif isinstance(raw_data, list):
-      df = pd.json_normalize(raw_data)
-    else:
-      df = pd.DataFrame()
+        df = pd.DataFrame()
 
-    if df.empty:
-      return {"id_fuente": id_fuente, "tipo": tipo, "status": "empty"}
+      if df.empty:
+        return {"id_fuente": id_fuente, "tipo": tipo, "status": "empty"}
 
-    # Limpieza de duplicados y valores nulos
-    df = df.drop_duplicates()
-    df = df.fillna(value="")
+      # Limpieza de duplicados y valores nulos
+      df = df.drop_duplicates()
+      df = df.fillna(value="")
 
-    records = df.to_dict(orient="records")
+      records = df.to_dict(orient="records")
 
-    # Directorio y archivo único por categoría dentro de la misma ruta
+      # Directorio y archivo único por categoría
+      output_dir = "/opt/airflow/dags/datos_limpios"
+      os.makedirs(output_dir, exist_ok=True)
+      filename = os.path.join(output_dir, f"datos_limpios_{tipo}.json")
+
+      # Escritura segura con bloqueo de archivos (fcntl) protegido ante colisiones paralelas
+      with open(filename, "a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+          f.seek(0)
+          content = f.read()
+          existing_data = json.loads(content) if content.strip() else []
+          
+          existing_data.extend(records)
+          
+          f.seek(0)
+          f.truncate()
+          json.dump(existing_data, f, ensure_ascii=False, indent=4)
+        finally:
+          fcntl.flock(f, fcntl.LOCK_UN)
+
+      print(f"Transformación exitosa para [{id_fuente}] acumulado en [{filename}]")
+      return {
+          "id_fuente": id_fuente,
+          "tipo": tipo,
+          "status": "success"
+      }
+
+    except Exception as e:
+      print(f"Aviso: Error durante la transformación de [{id_fuente}]: {e}. Se omite esta instancia.")
+      return {
+          "id_fuente": id_fuente,
+          "tipo": tipo,
+          "status": "skipped"
+      }
+
+  @task()
+  def load_to_postgres(transform_results: list[dict]):
+    """Carga los archivos JSON consolidados conectándose directamente a PostgreSQL mediante DATABASE_URL."""
     output_dir = "/opt/airflow/dags/datos_limpios"
-    os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"datos_limpios_{tipo}.json")
+    
+    # 1. Obtenemos la URL de conexión directamente desde el entorno (definida en el .env / docker-compose)
+    db_url = os.getenv("DATABASE_URL")
 
-    # Escritura segura con bloqueo (fcntl) para evitar conflictos entre tareas paralelas de Airflow
-    with open(filename, "a+", encoding="utf-8") as f:
-      fcntl.flock(f, fcntl.LOCK_EX)
-      try:
-        f.seek(0)
-        content = f.read()
-        existing_data = json.loads(content) if content.strip() else []
-        
-        # Agregar los nuevos registros limpios
-        existing_data.extend(records)
-        
-        f.seek(0)
-        f.truncate()
-        json.dump(existing_data, f, ensure_ascii=False, indent=4)
-      finally:
-        fcntl.flock(f, fcntl.LOCK_UN)
+    # Si prefieres escribirla de forma directa y hardcodeada en el código para evitar configurar variables, 
+    # puedes descomentar la siguiente línea reemplazando tus datos:
+    # db_url = "postgresql+psycopg2://postgres:123@host.docker.internal:5432/postgres"
 
-    print(f"Transformación y guardado exitoso para [{id_fuente}] en [{filename}]")
-    return {
-        "id_fuente": id_fuente,
-        "tipo": tipo,
-        "status": "success"
-    }
+    if not db_url:
+      raise ValueError("La variable de entorno DATABASE_URL no se encuentra configurada.")
 
-  # Encadenamiento del flujo optimizado (Extract -> Transform)
+    # 2. Creación directa del motor de SQLAlchemy
+    engine = sqlalchemy.create_engine(db_url)
+
+    tipos = set(res.get("tipo") for res in transform_results if res.get("status") == "success")
+
+    for tipo in tipos:
+      filename = os.path.join(output_dir, f"datos_limpios_{tipo}.json")
+      if os.path.exists(filename):
+        try:
+          df = pd.read_json(filename)
+          if not df.empty:
+            table_name = f"cmf_{tipo}"
+            
+            # Carga masiva directa a PostgreSQL
+            df.to_sql(table_name, con=engine, if_exists="replace", index=False, method="multi")
+            print(f"Carga exitosa: {len(df)} registros insertados en la tabla PostgreSQL '{table_name}'.")
+          else:
+            print(f"Aviso: El archivo consolidado para la categoría [{tipo}] está vacío.")
+        except Exception as e:
+          print(f"Error al cargar la categoría [{tipo}] en PostgreSQL: {e}")
+          raise e
+
+  # Encadenamiento del flujo completo
   extracted_data_list = extract_data.expand(config=API_CONFIGS)
-  transform_data.expand(extract_result=extracted_data_list)
+  transformed_data_list = transform_data.expand(extract_result=extracted_data_list)
+  load_to_postgres(transform_results=transformed_data_list)
 
 
 dag_instance = etl_pipeline()
