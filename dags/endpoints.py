@@ -2,9 +2,9 @@
 API_CONFIGS = []
 
 # Parámetros generales
-ANIOS = range(2020, 2023)  # 2020 a 2022
+ANIOS = range(2020, 2022)  # 2020 a 2022
 MESES = [f"{m:02d}" for m in range(1, 13)]  # "01" a "12"
-CODIGOS_INSTITUCIONES = ["001", "016", "012", "037", "028"]  # Primeros 5 bancos
+CODIGOS_INSTITUCIONES = ["001", "016", "012"]  # Primeros 5 bancos ["001", "016", "012", "037", "028"]
 
 # 1. Adecuación de capital (Bucle por año, mes e institución)
 for ano in ANIOS:
