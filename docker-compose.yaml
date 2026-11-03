@@ -63,6 +63,9 @@ x-airflow-common:
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+    DATABASE_URL: ${DATABASE_URL}
+
     PGHOST: host.docker.internal
     PGPORT: '5432'
     PGDATABASE: postgres
