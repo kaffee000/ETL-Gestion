@@ -55,7 +55,8 @@ def _engine():
     dag_id="etl_cmf_indicadores",
     default_args=DEFAULT_ARGS,
     description="ETL CMF (balances, resultados, adecuación) + indicadores ROA, ROE y apalancamiento",
-    schedule="@daily",
+                                                            # Mensual: la CMF publica cada mes, con cerca de un mes de desfase. Día 10, 06:00 de Chile.
+    schedule="0 9 10 * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,
