@@ -3,8 +3,10 @@
 ETL CMF Chile + 3 indicadores de gestión.
 
 Flujo visible en Airflow:
-  limpiar_staging -> extract_data[] -> transform_data[] -> load_to_postgres
+  aplicar_ddl -> limpiar_staging -> extract_data[] -> transform_data[] -> load_to_postgres
       -> preparar_base -> (kpi_roa | kpi_roe | kpi_apalancamiento) -> consolidar_indicadores
+
+Cada tarea registra su ejecución en audit.etl_audit.
 """
 from datetime import datetime, timedelta
 import glob
@@ -18,12 +20,15 @@ import requests
 import sqlalchemy
 
 try:  # Airflow 3
-    from airflow.sdk import dag, task
+    from airflow.sdk import dag, get_current_context, task
 except ImportError:  # Airflow 2.x
     from airflow.decorators import dag, task
+    from airflow.operators.python import get_current_context
 
 from endpoints_indicadores import API_CONFIGS
+from etl_comun import al_fallar, auditoria, ejecutar_sql
 import indicadores as ind
+from transform_cne import _pct_nulos, contar_filas
 
 STAGING_DIR = "/opt/airflow/dags/datos_indicadores"  # propio: no choca con etl_CMF
 REPORTE_DIR = "/opt/airflow/dags/reportes"
@@ -35,6 +40,7 @@ DEFAULT_ARGS = {
     "email_on_failure": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=2),
+    "on_failure_callback": al_fallar,
 }
 
 
@@ -59,10 +65,16 @@ def etl_cmf_indicadores():
 
     # ---------------------------------------------------------------- E T L
     @task()
+    def aplicar_ddl():
+        """Crea la tabla de auditoría si no existe. Se puede repetir sin efectos adicionales."""
+        ejecutar_sql("ddl.sql")
+
+    @task()
     def limpiar_staging():
         """Borra los JSON del run anterior para que los datos no se dupliquen."""
-        shutil.rmtree(STAGING_DIR, ignore_errors=True)
-        os.makedirs(STAGING_DIR, exist_ok=True)
+        with auditoria(get_current_context(), capa="preparacion"):
+            shutil.rmtree(STAGING_DIR, ignore_errors=True)
+            os.makedirs(STAGING_DIR, exist_ok=True)
         return STAGING_DIR
 
     @task(max_active_tis_per_dag=4)  # limita la concurrencia contra la API
@@ -71,26 +83,32 @@ def etl_cmf_indicadores():
         base = {k: config[k] for k in ("id_fuente", "tipo", "institucion", "anio", "mes")}
         api_key = os.getenv("API_KEY") or ""
         intentos = 3
-        for intento in range(1, intentos + 1):  # la API CMF es lenta: reintenta timeouts/cortes
-            try:
-                r = requests.get(config["url_template"], params={"apikey": api_key, "formato": "json"},
-                                 headers={"Accept": "application/json"}, timeout=(10, 180))
-                if r.status_code in (404, 500, 502, 503, 504):
-                    print(f"Aviso: [{config['id_fuente']}] HTTP {r.status_code}. Se omite.")
+        with auditoria(get_current_context(), fuente=config["id_fuente"], capa="extraccion") as m:
+            for intento in range(1, intentos + 1):  # la API CMF es lenta: reintenta timeouts/cortes
+                try:
+                    r = requests.get(config["url_template"], params={"apikey": api_key, "formato": "json"},
+                                     headers={"Accept": "application/json"}, timeout=(10, 180))
+                    if r.status_code in (404, 500, 502, 503, 504):
+                        print(f"Aviso: [{config['id_fuente']}] HTTP {r.status_code}. Se omite.")
+                        m.update(estado="omitida", leidas=0, cargadas=0, mensaje=f"HTTP {r.status_code}")
+                        return {**base, "raw_data": None}
+                    r.raise_for_status()
+                    datos = r.json()
+                    m.update(leidas=contar_filas(datos), cargadas=contar_filas(datos))
+                    return {**base, "raw_data": datos}
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    msg = str(e).replace(api_key, "***") if api_key else str(e)  # no exponer la key
+                    print(f"Aviso: [{config['id_fuente']}] intento {intento}/{intentos} falló: {msg}")
+                    if intento < intentos:
+                        time.sleep(30 * intento)
+                except requests.exceptions.RequestException as e:
+                    msg = str(e).replace(api_key, "***") if api_key else str(e)
+                    print(f"Aviso: error en [{config['id_fuente']}]: {msg}. Se omite.")
+                    m.update(estado="omitida", leidas=0, cargadas=0, mensaje=msg)
                     return {**base, "raw_data": None}
-                r.raise_for_status()
-                return {**base, "raw_data": r.json()}
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                msg = str(e).replace(api_key, "***") if api_key else str(e)  # no exponer la key
-                print(f"Aviso: [{config['id_fuente']}] intento {intento}/{intentos} falló: {msg}")
-                if intento < intentos:
-                    time.sleep(30 * intento)
-            except requests.exceptions.RequestException as e:
-                msg = str(e).replace(api_key, "***") if api_key else str(e)
-                print(f"Aviso: error en [{config['id_fuente']}]: {msg}. Se omite.")
-                return {**base, "raw_data": None}
-        print(f"Aviso: [{config['id_fuente']}] sin respuesta tras {intentos} intentos. Se omite.")
-        return {**base, "raw_data": None}
+            print(f"Aviso: [{config['id_fuente']}] sin respuesta tras {intentos} intentos. Se omite.")
+            m.update(estado="omitida", leidas=0, cargadas=0, mensaje=f"Sin respuesta tras {intentos} intentos")
+            return {**base, "raw_data": None}
 
     @task()
     def transform_data(extract_result: dict) -> dict:
@@ -100,30 +118,34 @@ def etl_cmf_indicadores():
         if not raw:
             return {**meta, "status": "skipped"}
 
-        if isinstance(raw, dict):
-            listas = [k for k, v in raw.items() if isinstance(v, list)]
-            df = pd.json_normalize(raw[listas[0]]) if listas else pd.json_normalize([raw])
-        elif isinstance(raw, list):
-            df = pd.json_normalize(raw)
-        else:
-            df = pd.DataFrame()
+        with auditoria(get_current_context(), fuente=meta["id_fuente"], capa="transformacion") as m:
+            if isinstance(raw, dict):
+                listas = [k for k, v in raw.items() if isinstance(v, list)]
+                df = pd.json_normalize(raw[listas[0]]) if listas else pd.json_normalize([raw])
+            elif isinstance(raw, list):
+                df = pd.json_normalize(raw)
+            else:
+                df = pd.DataFrame()
 
-        if df.empty:
-            return {**meta, "status": "empty"}
+            if df.empty:
+                m.update(estado="omitida", leidas=0, cargadas=0, mensaje="La API no devolvió filas")
+                return {**meta, "status": "empty"}
 
-        df = df.drop_duplicates().fillna("")
-        # Llaves de negocio para poder agrupar en los indicadores
-        df["institucion"] = meta["institucion"]
-        df["anio"] = meta["anio"]
-        if meta.get("mes") and "mes" not in [c.lower() for c in df.columns]:
-            df["mes"] = meta["mes"]
-        df["id_fuente"] = meta["id_fuente"]
+            leidas, nulos = len(df), _pct_nulos(df, list(df.columns))
+            df = df.drop_duplicates().fillna("")
+            # Llaves de negocio para poder agrupar en los indicadores
+            df["institucion"] = meta["institucion"]
+            df["anio"] = meta["anio"]
+            if meta.get("mes") and "mes" not in [c.lower() for c in df.columns]:
+                df["mes"] = meta["mes"]
+            df["id_fuente"] = meta["id_fuente"]
 
-        # Un archivo por fuente: no hay escrituras concurrentes sobre el mismo archivo
-        path = os.path.join(STAGING_DIR, f"{meta['tipo']}__{meta['id_fuente']}.json")
-        df.to_json(path, orient="records", force_ascii=False)
-        print(f"OK [{meta['id_fuente']}]: {len(df)} filas -> {path}")
-        return {**meta, "status": "success", "filas": len(df)}
+            # Un archivo por fuente: no hay escrituras concurrentes sobre el mismo archivo
+            path = os.path.join(STAGING_DIR, f"{meta['tipo']}__{meta['id_fuente']}.json")
+            df.to_json(path, orient="records", force_ascii=False)
+            print(f"OK [{meta['id_fuente']}]: {len(df)} filas -> {path}")
+            m.update(leidas=leidas, cargadas=len(df), rechazadas=leidas - len(df), pct_nulos=nulos)
+            return {**meta, "status": "success", "filas": len(df)}
 
     @task()
     def load_to_postgres(transform_results: list[dict]) -> dict:
@@ -132,14 +154,16 @@ def etl_cmf_indicadores():
         resumen = {}
         tipos = {r["tipo"] for r in transform_results if r.get("status") == "success"}
         for tipo in sorted(tipos):
-            archivos = glob.glob(os.path.join(STAGING_DIR, f"{tipo}__*.json"))
-            df = pd.concat([pd.read_json(a, orient="records", dtype=False) for a in archivos],
-                           ignore_index=True)
-            df = df.astype(str)  # la API entrega todo como texto; se tipa en los indicadores
-            df.to_sql(f"cmf_ind_{tipo}", con=engine, if_exists="replace", index=False,
-                      method="multi", chunksize=1000)
-            resumen[tipo] = len(df)
-            print(f"Carga exitosa: {len(df)} registros en cmf_ind_{tipo}")
+            with auditoria(get_current_context(), fuente=tipo, capa="carga") as m:
+                archivos = glob.glob(os.path.join(STAGING_DIR, f"{tipo}__*.json"))
+                df = pd.concat([pd.read_json(a, orient="records", dtype=False) for a in archivos],
+                               ignore_index=True)
+                df = df.astype(str)  # la API entrega todo como texto; se tipa en los indicadores
+                df.to_sql(f"cmf_ind_{tipo}", con=engine, if_exists="replace", index=False,
+                          method="multi", chunksize=1000)
+                resumen[tipo] = len(df)
+                m.update(leidas=len(df), cargadas=len(df))
+                print(f"Carga exitosa: {len(df)} registros en cmf_ind_{tipo}")
         if not resumen:
             raise ValueError("Ninguna fuente devolvió datos: revisa API_KEY y la conexión a la API.")
         return resumen
@@ -149,46 +173,64 @@ def etl_cmf_indicadores():
     def preparar_base(resumen_carga: dict) -> list[dict]:
         """Lee balances y resultados desde PostgreSQL y arma la tabla banco-año."""
         engine = _engine()
-        with engine.connect() as conn:
-            balances = pd.read_sql(sqlalchemy.text("SELECT * FROM cmf_ind_balances"), conn)
-            resultados = pd.read_sql(sqlalchemy.text("SELECT * FROM cmf_ind_resultados"), conn)
-        base = ind.base_indicadores(balances, resultados)
-        faltantes = base[base[["activos", "pasivos", "patrimonio", "utilidad"]].isna().any(axis=1)]
-        if not faltantes.empty:
-            print("Aviso: bancos/años con cuentas faltantes:\n", faltantes.to_string())
-        print(base.to_string())
-        return json.loads(base.to_json(orient="records"))
+        with auditoria(get_current_context(), capa="indicadores") as m:
+            with engine.connect() as conn:
+                balances = pd.read_sql(sqlalchemy.text("SELECT * FROM cmf_ind_balances"), conn)
+                resultados = pd.read_sql(sqlalchemy.text("SELECT * FROM cmf_ind_resultados"), conn)
+            base = ind.base_indicadores(balances, resultados)
+            cuentas = base[["activos", "pasivos", "patrimonio", "utilidad"]]
+            faltantes = base[cuentas.isna().any(axis=1)]
+            if not faltantes.empty:
+                print("Aviso: bancos/años con cuentas faltantes:\n", faltantes.to_string())
+            print(base.to_string())
+            m.update(leidas=len(balances) + len(resultados), cargadas=len(base), rechazadas=len(faltantes),
+                     pct_nulos=round(float(cuentas.isna().to_numpy().mean()) * 100, 2))
+            return json.loads(base.to_json(orient="records"))
 
     @task()
     def kpi_roa(base: list[dict]) -> list[dict]:
         """Indicador 1: ROA = Utilidad / Activos totales (%)."""
-        return json.loads(ind.kpi_roa(pd.DataFrame(base)).to_json(orient="records"))
+        with auditoria(get_current_context(), capa="indicadores") as m:
+            salida = json.loads(ind.kpi_roa(pd.DataFrame(base)).to_json(orient="records"))
+            m.update(leidas=len(base), cargadas=len(salida))
+            return salida
 
     @task()
     def kpi_roe(base: list[dict]) -> list[dict]:
         """Indicador 2: ROE = Utilidad / Patrimonio (%)."""
-        return json.loads(ind.kpi_roe(pd.DataFrame(base)).to_json(orient="records"))
+        with auditoria(get_current_context(), capa="indicadores") as m:
+            salida = json.loads(ind.kpi_roe(pd.DataFrame(base)).to_json(orient="records"))
+            m.update(leidas=len(base), cargadas=len(salida))
+            return salida
 
     @task()
     def kpi_apalancamiento(base: list[dict]) -> list[dict]:
         """Indicador 3: Apalancamiento = Pasivos / Patrimonio (veces)."""
-        return json.loads(ind.kpi_apalancamiento(pd.DataFrame(base)).to_json(orient="records"))
+        with auditoria(get_current_context(), capa="indicadores") as m:
+            salida = json.loads(ind.kpi_apalancamiento(pd.DataFrame(base)).to_json(orient="records"))
+            m.update(leidas=len(base), cargadas=len(salida))
+            return salida
 
     @task()
     def consolidar_indicadores(roa: list[dict], roe: list[dict], apal: list[dict]):
         """Une los 3 indicadores, agrega variación anual y semáforo, y los guarda."""
-        df = ind.consolidar(pd.DataFrame(roa), pd.DataFrame(roe), pd.DataFrame(apal))
-        df["fecha_calculo"] = datetime.now()
-        df.to_sql(TABLA_INDICADORES, con=_engine(), if_exists="replace", index=False)
+        with auditoria(get_current_context(), capa="indicadores") as m:
+            df = ind.consolidar(pd.DataFrame(roa), pd.DataFrame(roe), pd.DataFrame(apal))
+            df["fecha_calculo"] = datetime.now()
+            df.to_sql(TABLA_INDICADORES, con=_engine(), if_exists="replace", index=False)
 
-        os.makedirs(REPORTE_DIR, exist_ok=True)
-        df.to_csv(os.path.join(REPORTE_DIR, "indicadores_gestion.csv"), index=False)
-        pivote = df.pivot_table(index=["institucion", "anio"], columns="indicador", values="valor")
-        print("Indicadores de gestión:\n", pivote.round(2).to_string())
-        print(f"Guardado en tabla '{TABLA_INDICADORES}' y en {REPORTE_DIR}/indicadores_gestion.csv")
+            os.makedirs(REPORTE_DIR, exist_ok=True)
+            df.to_csv(os.path.join(REPORTE_DIR, "indicadores_gestion.csv"), index=False)
+            pivote = df.pivot_table(index=["institucion", "anio"], columns="indicador", values="valor")
+            print("Indicadores de gestión:\n", pivote.round(2).to_string())
+            print(f"Guardado en tabla '{TABLA_INDICADORES}' y en {REPORTE_DIR}/indicadores_gestion.csv")
+            m.update(leidas=len(roa) + len(roe) + len(apal), cargadas=len(df),
+                     pct_nulos=round(float(df["valor"].isna().mean()) * 100, 2))
 
     # ------------------------------------------------------------- F L U J O
+    ddl = aplicar_ddl()
     staging = limpiar_staging()
+    ddl >> staging
     extraidos = extract_data.expand(config=API_CONFIGS)
     staging >> extraidos
     transformados = transform_data.expand(extract_result=extraidos)

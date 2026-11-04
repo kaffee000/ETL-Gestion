@@ -10,6 +10,7 @@ La API responde HTTP 200 con un cuerpo como {"status": "Authorization Token not 
 cuando hay un problema, así que no basta con revisar el código HTTP.
 """
 import os
+import time
 
 import requests
 
@@ -77,6 +78,12 @@ class ClienteCNE:
             r = self._session.get(url, headers={"Authorization": f"Bearer {self._token}",
                                                 "Accept": "application/json"},
                                   timeout=self._timeout)
+            if r.status_code == 429:  # límite de consultas: espera lo que indique la API
+                espera = min(int(r.headers.get("Retry-After", 30)), 120)
+                print(f"Aviso: la API pidió esperar {espera}s (HTTP 429).")
+                time.sleep(espera)
+                r = self._session.get(url, headers={"Authorization": f"Bearer {self._token}",
+                                                    "Accept": "application/json"}, timeout=self._timeout)
             rechazado = r.status_code in (401, 403)
             detalle = f"HTTP {r.status_code}"
             payload = None
