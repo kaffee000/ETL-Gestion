@@ -81,8 +81,11 @@ def indicadores_gestion():
                 conn.execute(text("""
                     INSERT INTO dw.fact_finanzas_banco (id_tiempo, id_banco, activos, pasivos, patrimonio, utilidad)
                     VALUES (:id_tiempo, :institucion, :activos, :pasivos, :patrimonio, :utilidad)
-                    ON CONFLICT (id_tiempo, id_banco) DO UPDATE SET activos = EXCLUDED.activos,
-                        pasivos = EXCLUDED.pasivos, patrimonio = EXCLUDED.patrimonio, utilidad = EXCLUDED.utilidad
+                    ON CONFLICT (id_tiempo, id_banco) DO UPDATE SET
+                        activos = COALESCE(EXCLUDED.activos, dw.fact_finanzas_banco.activos),
+                        pasivos = COALESCE(EXCLUDED.pasivos, dw.fact_finanzas_banco.pasivos),
+                        patrimonio = COALESCE(EXCLUDED.patrimonio, dw.fact_finanzas_banco.patrimonio),
+                        utilidad = COALESCE(EXCLUDED.utilidad, dw.fact_finanzas_banco.utilidad)
                 """), filas)
             m["cargadas"] = len(filas)
             print(f"dw.fact_finanzas_banco: {len(filas)} filas banco-año.")

@@ -5,25 +5,32 @@ ETL CMF Chile + 3 indicadores de gestión.
 Flujo visible en Airflow:
   aplicar_ddl -> limpiar_staging -> extract_data[] -> transform_data[] -> load_to_postgres
       -> preparar_base -> (kpi_roa | kpi_roe | kpi_apalancamiento) -> consolidar_indicadores
+      -> resumen_ejecucion
 
+Si un endpoint falla, esa fuente reintenta y queda en rojo; las demás continúan y la fuente conserva su
+último dato válido. resumen_ejecucion marca el run como fallido para que el error no pase inadvertido.
 Cada tarea registra su ejecución en audit.etl_audit.
+
+Parámetro al ejecutar a mano:
+  fuente_falla  id de una fuente para la demostración de falla controlada, por ejemplo balances_001_2020
 """
 from datetime import datetime, timedelta
 import glob
 import json
 import os
 import shutil
-import time
 
 import pandas as pd
 import requests
 import sqlalchemy
 
 try:  # Airflow 3
-    from airflow.sdk import dag, get_current_context, task
+    from airflow.sdk import Param, dag, get_current_context, task
 except ImportError:  # Airflow 2.x
     from airflow.decorators import dag, task
+    from airflow.models.param import Param
     from airflow.operators.python import get_current_context
+from airflow.exceptions import AirflowFailException
 
 from endpoints_indicadores import API_CONFIGS
 from etl_comun import al_fallar, auditoria, ejecutar_sql
@@ -33,13 +40,18 @@ from transform_cne import _pct_nulos, contar_filas
 STAGING_DIR = "/opt/airflow/dags/datos_indicadores"  # propio: no choca con etl_CMF
 REPORTE_DIR = "/opt/airflow/dags/reportes"
 TABLA_INDICADORES = "cmf_indicadores_gestion"
+DAG_ID = "etl_cmf_indicadores"
+URL_DEMO_FALLA = "https://api.cmfchile.cl/api-sbifv3/recursos_api/ruta-inexistente-demo-falla"
 
 DEFAULT_ARGS = {
     "owner": "airflow",
     "depends_on_past": False,
     "email_on_failure": False,
     "retries": 2,
-    "retry_delay": timedelta(minutes=2),
+    "retry_delay": timedelta(seconds=30),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=10),
+    "execution_timeout": timedelta(minutes=20),
     "on_failure_callback": al_fallar,
 }
 
@@ -51,15 +63,34 @@ def _engine():
     return sqlalchemy.create_engine(db_url)
 
 
+def _reemplazar_fuentes(engine, tabla: str, df: pd.DataFrame) -> int:
+    """Reemplaza solo las filas de las fuentes recibidas. Devuelve cuántas filas de otras fuentes se conservan."""
+    with engine.begin() as conn:
+        inspector = sqlalchemy.inspect(conn)
+        if not inspector.has_table(tabla):
+            df.to_sql(tabla, con=conn, index=False, method="multi", chunksize=1000)
+            return 0
+        columnas = {c["name"] for c in inspector.get_columns(tabla)}
+        for columna in df.columns:
+            if columna not in columnas:  # la CMF puede agregar campos
+                conn.execute(sqlalchemy.text(f'ALTER TABLE "{tabla}" ADD COLUMN "{columna}" TEXT'))
+        conn.execute(sqlalchemy.text(f'DELETE FROM "{tabla}" WHERE id_fuente = ANY(:fuentes)'),
+                     {"fuentes": df["id_fuente"].unique().tolist()})
+        conservadas = conn.execute(sqlalchemy.text(f'SELECT COUNT(*) FROM "{tabla}"')).scalar()
+        df.to_sql(tabla, con=conn, if_exists="append", index=False, method="multi", chunksize=1000)
+    return conservadas
+
+
 @dag(
-    dag_id="etl_cmf_indicadores",
+    dag_id=DAG_ID,
     default_args=DEFAULT_ARGS,
     description="ETL CMF (balances, resultados, adecuación) + indicadores ROA, ROE y apalancamiento",
-                                                            # Mensual: la CMF publica cada mes, con cerca de un mes de desfase. Día 10, 06:00 de Chile.
+    # Mensual: la CMF publica cada mes, con cerca de un mes de desfase. Día 10, 06:00 de Chile.
     schedule="0 9 10 * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,
+    params={"fuente_falla": Param("", type="string", description="Fuente con URL incorrecta, para la demostración")},
     tags=["etls", "chile", "apis", "indicadores"],
 )
 def etl_cmf_indicadores():
@@ -80,38 +111,42 @@ def etl_cmf_indicadores():
 
     @task(max_active_tis_per_dag=4)  # limita la concurrencia contra la API
     def extract_data(config: dict) -> dict:
-        """Consulta un endpoint de la CMF; errores de red o HTTP se registran y se omiten."""
+        """
+        Consulta un endpoint de la CMF. Si hay un error, la tarea falla y Airflow la reintenta;
+        las demás fuentes continúan. Solo las fuentes opcionales se omiten sin fallar.
+        """
+        contexto = get_current_context()
+        id_fuente = config["id_fuente"]
         base = {k: config[k] for k in ("id_fuente", "tipo", "institucion", "anio", "mes")}
         api_key = os.getenv("API_KEY") or ""
-        intentos = 3
-        with auditoria(get_current_context(), fuente=config["id_fuente"], capa="extraccion") as m:
-            for intento in range(1, intentos + 1):  # la API CMF es lenta: reintenta timeouts/cortes
-                try:
-                    r = requests.get(config["url_template"], params={"apikey": api_key, "formato": "json"},
-                                     headers={"Accept": "application/json"}, timeout=(10, 180))
-                    if r.status_code in (404, 500, 502, 503, 504):
-                        print(f"Aviso: [{config['id_fuente']}] HTTP {r.status_code}. Se omite.")
-                        m.update(estado="omitida", leidas=0, cargadas=0, mensaje=f"HTTP {r.status_code}")
-                        return {**base, "raw_data": None}
-                    r.raise_for_status()
-                    datos = r.json()
-                    m.update(leidas=contar_filas(datos), cargadas=contar_filas(datos))
-                    return {**base, "raw_data": datos}
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                    msg = str(e).replace(api_key, "***") if api_key else str(e)  # no exponer la key
-                    print(f"Aviso: [{config['id_fuente']}] intento {intento}/{intentos} falló: {msg}")
-                    if intento < intentos:
-                        time.sleep(30 * intento)
-                except requests.exceptions.RequestException as e:
-                    msg = str(e).replace(api_key, "***") if api_key else str(e)
-                    print(f"Aviso: error en [{config['id_fuente']}]: {msg}. Se omite.")
-                    m.update(estado="omitida", leidas=0, cargadas=0, mensaje=msg)
-                    return {**base, "raw_data": None}
-            print(f"Aviso: [{config['id_fuente']}] sin respuesta tras {intentos} intentos. Se omite.")
-            m.update(estado="omitida", leidas=0, cargadas=0, mensaje=f"Sin respuesta tras {intentos} intentos")
-            return {**base, "raw_data": None}
+        url = config["url_template"]
+        if contexto["params"].get("fuente_falla") == id_fuente:
+            print(f"DEMOSTRACIÓN: se usa una URL incorrecta para '{id_fuente}'.")
+            url = URL_DEMO_FALLA
 
-    @task()
+        with auditoria(contexto, fuente=id_fuente, capa="extraccion") as m:
+            error = None
+            try:
+                r = requests.get(url, params={"apikey": api_key, "formato": "json"},
+                                 headers={"Accept": "application/json"}, timeout=(10, 180))
+                if r.status_code >= 400:
+                    error = f"HTTP {r.status_code}"
+                else:
+                    datos = r.json()
+            except requests.exceptions.RequestException as e:  # incluye timeouts, SSL y JSON inválido
+                error = f"{type(e).__name__}: {e}".replace(api_key, "***") if api_key else f"{type(e).__name__}: {e}"
+
+            if error is None:
+                m.update(leidas=contar_filas(datos), cargadas=contar_filas(datos))
+                return {**base, "raw_data": datos}
+            if config.get("opcional"):
+                print(f"Aviso: [{id_fuente}] {error}. Es opcional: se omite.")
+                m.update(estado="omitida", leidas=0, cargadas=0, mensaje=error)
+                return {**base, "raw_data": None}
+            # Sin encadenar el error original: su texto incluye la URL con la clave de la API
+            raise RuntimeError(f"[{id_fuente}] {error}") from None
+
+    @task(trigger_rule="all_done")  # corre para las fuentes que sí entregaron datos
     def transform_data(extract_result: dict) -> dict:
         """Normaliza el JSON a tabla, limpia y lo guarda en un archivo por fuente."""
         raw = extract_result.pop("raw_data", None)
@@ -148,25 +183,24 @@ def etl_cmf_indicadores():
             m.update(leidas=leidas, cargadas=len(df), rechazadas=leidas - len(df), pct_nulos=nulos)
             return {**meta, "status": "success", "filas": len(df)}
 
-    @task()
+    @task(trigger_rule="all_done", retries=0)
     def load_to_postgres(transform_results: list[dict]) -> dict:
-        """Consolida los archivos de cada categoría y los carga en cmf_ind_<tipo>."""
+        """Actualiza solo las fuentes que entregaron datos; las que fallaron conservan su último dato válido."""
         engine = _engine()
         resumen = {}
-        tipos = {r["tipo"] for r in transform_results if r.get("status") == "success"}
+        tipos = {r["tipo"] for r in transform_results if r and r.get("status") == "success"}
         for tipo in sorted(tipos):
             with auditoria(get_current_context(), fuente=tipo, capa="carga") as m:
                 archivos = glob.glob(os.path.join(STAGING_DIR, f"{tipo}__*.json"))
                 df = pd.concat([pd.read_json(a, orient="records", dtype=False) for a in archivos],
                                ignore_index=True)
                 df = df.astype(str)  # la API entrega todo como texto; se tipa en los indicadores
-                df.to_sql(f"cmf_ind_{tipo}", con=engine, if_exists="replace", index=False,
-                          method="multi", chunksize=1000)
+                conservadas = _reemplazar_fuentes(engine, f"cmf_ind_{tipo}", df)
                 resumen[tipo] = len(df)
-                m.update(leidas=len(df), cargadas=len(df))
-                print(f"Carga exitosa: {len(df)} registros en cmf_ind_{tipo}")
+                m.update(leidas=len(df), cargadas=len(df), mensaje=f"{conservadas} filas conservadas de otras fuentes")
+                print(f"Carga exitosa: {len(df)} registros en cmf_ind_{tipo}; se conservan {conservadas} de otras fuentes")
         if not resumen:
-            raise ValueError("Ninguna fuente devolvió datos: revisa API_KEY y la conexión a la API.")
+            raise ValueError("Ninguna fuente devolvió datos: las tablas conservan su último dato válido.")
         return resumen
 
     # ----------------------------------------------------- I N D I C A D O R E S
@@ -228,6 +262,23 @@ def etl_cmf_indicadores():
             m.update(leidas=len(roa) + len(roe) + len(apal), cargadas=len(df),
                      pct_nulos=round(float(df["valor"].isna().mean()) * 100, 2))
 
+    @task(trigger_rule="all_done", retries=0)
+    def resumen_ejecucion():
+        """Marca el run como fallido si alguna tarea falló, después de dejar correr todo lo demás."""
+        run_id = get_current_context()["ti"].run_id
+        with _engine().connect() as conn:
+            filas = pd.read_sql(sqlalchemy.text("""
+                SELECT task_id, fuente, estado, COUNT(*) AS n, MAX(LEFT(mensaje, 100)) AS mensaje
+                FROM audit.etl_audit WHERE dag_id = :d AND run_id = :r GROUP BY 1, 2, 3 ORDER BY 1, 2
+            """), conn, params={"d": DAG_ID, "r": run_id})
+        print(filas.to_string())
+        fallidas = filas[filas["estado"] == "failed"]
+        if not fallidas.empty:
+            exitos = set(filas.loc[filas["estado"] == "success", "fuente"].dropna())
+            fuentes = sorted(set(filas.loc[filas["estado"] == "error_intento", "fuente"].dropna()) - exitos)
+            raise AirflowFailException(f"Fuentes con falla: {fuentes or 'revisar tareas'}. "
+                                       f"Tareas: {sorted(set(fallidas['task_id']))}. El resto del flujo continuó.")
+
     # ------------------------------------------------------------- F L U J O
     ddl = aplicar_ddl()
     staging = limpiar_staging()
@@ -238,7 +289,8 @@ def etl_cmf_indicadores():
     carga = load_to_postgres(transformados)
 
     base = preparar_base(carga)
-    consolidar_indicadores(kpi_roa(base), kpi_roe(base), kpi_apalancamiento(base))
+    fin = consolidar_indicadores(kpi_roa(base), kpi_roe(base), kpi_apalancamiento(base))
+    fin >> resumen_ejecucion()
 
 
 etl_cmf_indicadores()

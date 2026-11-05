@@ -5,7 +5,7 @@
 
 API_BASE = "https://api.cmfchile.cl/api-sbifv3/recursos_api"
 
-ANIOS = range(2020, 2026)  # 2020 a 2025
+ANIOS = range(2020, 2021)  # 2020 a 2025
 MESES = [f"{m:02d}" for m in range(1, 13)]
 CODIGOS_INSTITUCIONES = ["001", "016", "012", "037", "028"]  # 5 bancos
 
@@ -36,6 +36,7 @@ for anio in ANIOS:
         })
 
 # 3. Adecuación de capital (solo diciembre de cada año, para no saturar la API).
+# Es opcional: no se usa en los indicadores y la API suele responder con error, así que se omite sin fallar.
 for anio in ANIOS:
     for inst in CODIGOS_INSTITUCIONES:
         API_CONFIGS.append({
@@ -45,4 +46,5 @@ for anio in ANIOS:
             "institucion": inst,
             "anio": anio,
             "mes": "12",
+            "opcional": True,
         })
